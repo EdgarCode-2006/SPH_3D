@@ -1,0 +1,122 @@
+// Data
+#include "../ParticleData.hlsl"
+
+#pragma kernel BlellochScan
+#pragma kernel sumOffsetAddition
+
+RWStructuredBuffer<uint> elements;
+RWStructuredBuffer<uint> blellochScanned;
+RWStructuredBuffer<uint> scannedSums;
+
+RWStructuredBuffer<DebugStruct> debugData;
+
+groupshared uint sweeped[256];
+
+/*
+* We have a sweeped array allocated in group memory which is the binary
+* tree for the blelloch algorithm represented in 1 Dimention. this
+* array is in local memory meaning that it is reused automatically
+* by thread groups after this one when it is done.
+*/
+
+[numthreads(256,1,1)]
+void BlellochScan(
+    uint3 localId : SV_GroupThreadID,
+    uint3 groupId : SV_GroupID
+)
+{
+    uint threadIndex  = localId.x;
+    uint blockIndex   = groupId.x;
+    uint globalOffset = blockIndex * BLOCK_SIZE;
+    uint value = 0;
+
+    // --- LOAD with correct bound check (global index) ---
+    uint globalIndex = globalOffset + threadIndex;
+
+    // (was elementCount * BLOCK_SIZE, which read past the end of the input at the
+    //  deeper recursion levels; only harmless because D3D11 returns 0 out of bounds)
+    if (globalIndex < elementCount)
+        sweeped[threadIndex] = elements[globalIndex];
+    else
+        sweeped[threadIndex] = 0;
+    GroupMemoryBarrierWithGroupSync();
+
+    // --- UPSWEEP ---
+    uint offset = 1;
+    uint ai = 0;
+    uint bi = 0;
+
+    for (uint d = BLOCK_SIZE >> 1; d > 0; d >>= 1)
+    {
+        GroupMemoryBarrierWithGroupSync(); // ensure previous round writes visible
+
+        if (threadIndex < d)
+        {
+            ai = offset * (2 * threadIndex + 1) - 1;
+            bi = offset * (2 * threadIndex + 2) - 1;
+            sweeped[bi] += sweeped[ai];
+        }
+
+        offset <<= 1;
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    // save block sum and set last element to 0 for downsweep
+    if (threadIndex == (BLOCK_SIZE - 1)) {
+        scannedSums[blockIndex] = sweeped[threadIndex];
+        sweeped[threadIndex] = 0;
+    }
+
+    // === DOWNSWEEP ===
+    offset = BLOCK_SIZE;
+    uint parent_i = 0;
+    uint child_i = 0;
+    uint temp = 0;
+
+    for (uint k = 1; k < BLOCK_SIZE; k <<= 1)
+    {
+        offset >>= 1;
+        GroupMemoryBarrierWithGroupSync();
+
+        if (threadIndex < k)
+        {
+            parent_i = offset * (2 * threadIndex + 2) - 1;
+            child_i  = offset * (2 * threadIndex + 1) - 1;
+
+            temp = sweeped[parent_i];
+            sweeped[parent_i] += sweeped[child_i];
+            sweeped[child_i] = temp;
+        }
+    }
+
+    /*
+    * Wait for the last downsweep round before reading the results. Without this, the
+    * threads that sat out that round (128..255) could read sweeped[] before threads
+    * 64..127 wrote it, giving some cells a wrong start offset. ReorderParticles copies
+    * particle data through those offsets every step, so one wrong offset permanently
+    * duplicates some particles and deletes others.
+    */
+    GroupMemoryBarrierWithGroupSync();
+
+    // final write back with global bound check
+    if (globalIndex < elementCount)
+        blellochScanned[globalIndex] = sweeped[threadIndex];
+}
+
+[numthreads(256,1,1)]
+void sumOffsetAddition(
+    uint3 localId : SV_GroupThreadID,   // thread index inside the group
+    uint3 groupId : SV_GroupID
+)
+{
+    uint threadIndex = localId.x;        // index of the current trhead running inside the group
+    uint sumIndex = groupId.x;        // which block this group is scanning
+
+    // if the index is 0 the sum is also 0 so we
+    // skip it since we dont need to add 0 to the sequence.
+    uint currentSum = scannedSums[sumIndex];
+    uint offset = sumIndex * BLOCK_SIZE;
+    
+    blellochScanned[offset + threadIndex] += currentSum;
+}

@@ -1,0 +1,55 @@
+// #include "../ParticleData.hlsl"
+
+#pragma kernel CSBitonic_Sort
+
+// // The stage of the sorting algo
+// uint k;
+
+// // The distance for each pair from indx i
+// uint j;
+
+// // THe direction either ascending or descending of the current pass
+// int dir;
+
+// // The data being sorted
+// // data = MortonPairs[]
+
+// // n, the number of elements being sorted
+// // n = particleCount
+
+// // RWStructuredBuffer<MortonPair> mortonPairs;
+
+// void swap(uint i, uint ixj)
+// {
+//     MortonPair temp = (MortonPair)0;
+
+//     temp = mortonPairs[i];
+//     mortonPairs[i] = mortonPairs[ixj];
+//     mortonPairs[ixj] = temp;
+// }
+
+// void swapComp(int ascending, uint i, uint ixj)
+// {
+//     if (ascending == (mortonPairs[i].mortonCode > mortonPairs[ixj].mortonCode)) {
+//         swap(i, ixj);
+//     }
+// }
+
+[numthreads(256,1,1)]
+void CSBitonic_Sort(uint3 id : SV_DispatchThreadID)
+{
+    return;
+    // uint i = id.x;
+    // int ascending = 0;
+    // uint ixj = 0;
+
+    // if (i >= particleCount)
+    //     return;
+
+    // ixj = (i ^ j);
+
+    // if (ixj > i) {
+    //     ascending = ((i & k) == 0) ? dir : !dir;
+    //     swapComp(ascending, i, ixj);
+    // }
+}

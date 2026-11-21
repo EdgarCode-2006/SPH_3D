@@ -1,0 +1,367 @@
+// Data
+#include "../ParticleData.hlsl"
+#include "computation/ExternalForces.hlsl"
+
+// Computation
+#include "computation/Collision.hlsl"
+#include "optimization/PositionToIndex.hlsl"
+#include "computation/smoothingKernels.hlsl"
+#include "computation/computePressure.hlsl"
+
+// kernels (dispatched in this order, after ReorderParticles in SpacialIndexer.compute)
+#pragma kernel DensityPass
+#pragma kernel CSMain
+
+/*
+* Safety cap on how many particles are read from each neighbour row (3 cells along x).
+* In normal running a cell holds ~8 particles (1-unit spacing, smoothing radius 2), so a
+* row holds ~24 and this never kicks in. If particles ever pile into a few cells
+* (explosion, bad spawn), the neighbour loops would otherwise go O(n^2), run for seconds,
+* and make Windows reset the GPU (TDR), which kills the editor. With the cap you get a
+* wrong frame instead. 3 x 128 = same total limit as the old 128-per-cell cap.
+*/
+#define MAX_NEIGHBORS_PER_ROW 384u
+
+/*
+* Velocity/position integrator used by CSMain.
+*   1 = RK4 (integrateRK4): 4 force evaluations per step, ~4x the neighbour-loop work.
+*   0 = semi-implicit Euler, the original integrator: 1 force evaluation per step.
+*/
+#define USE_RK4 0
+
+// Speed safety cap (units/s) applied to every velocity the integrator produces.
+#define MAX_SPEED 50.0
+
+/*
+* PARTICLE DATA
+* Split into one buffer per field (structure of arrays), so a loop only reads the fields
+* it needs, and double-buffered so no thread ever reads a value another thread is
+* writing during the same step.
+*
+*   READ  (sorted*) - copy of every particle made by ReorderParticles at the start of the
+*                     step, in grid-cell order. Slot s = s-th particle of the sorted grid,
+*                     so particles in neighbouring cells are next to each other in memory.
+*                     All neighbour reads come from these buffers, by slot (no lookup).
+*   WRITE (plain)   - the new state written by CSMain. Thread `slot` writes slot `slot`,
+*                     so these end up in this step's cell order too, and next step's sort
+*                     reads them almost in order.
+*
+*   positions             xyz = position, w = 1 for a wall particle, 0 for fluid
+*   velocities            xyz = velocity
+*   sortedDensityPressure x = density, y = pressure (computed fresh by DensityPass)
+*/
+StructuredBuffer<float4> sortedPositions;
+StructuredBuffer<float4> sortedVelocities;
+RWStructuredBuffer<float2> sortedDensityPressure;   // written by DensityPass, read by CSMain
+
+RWStructuredBuffer<float4> positions;
+RWStructuredBuffer<float4> velocities;
+
+// Grid: the particles of cell c are in slots [cellStarts[c], cellStarts[c] + cellSizes[c]).
+StructuredBuffer<uint> cellStarts;
+StructuredBuffer<uint> cellSizes;
+
+// This strcut holds values for debugging later by fetching back to the CPU
+RWStructuredBuffer<DebugStruct> debugData;
+
+// Builds the local Particle struct for one slot of the sorted (read) buffers.
+Particle loadSortedParticle(uint slot)
+{
+    Particle p = (Particle)0;
+    p.position = sortedPositions[slot];
+    p.velocity = sortedVelocities[slot];
+    float2 densityPressure = sortedDensityPressure[slot];
+    p.density = densityPressure.x;
+    p.pressure = densityPressure.y;
+    p.isBoundary = (p.position.w != 0.0) ? 1u : 0u;
+    return p;
+}
+
+// Writes a particle's new state into the write buffers (the wall flag goes in position.w).
+void storeParticle(uint slot, Particle p)
+{
+    positions[slot] = float4(p.position.xyz, (p.isBoundary != 0) ? 1.0 : 0.0);
+    velocities[slot] = float4(p.velocity.xyz, 0.0);
+}
+
+/*
+* Pressure and viscosity terms between pi and one neighbour j. The neighbour loop only
+* calls these once the distance r is known to be valid and within the smoothing radius.
+*/
+float3 computePressureForce(float3 rij, float r, float densityI, float pressureI, float densityJ, float pressureJ)
+{
+    if (r < MIN_DISTANCE || densityJ <= 0.0 || densityI <= 0.0) return float3(0, 0, 0);
+    float pressureForceScalar = particleMass * ((pressureI / (densityI * densityI)) + (pressureJ / (densityJ * densityJ)));
+    return pressureForceScalar * spkiyKernelGrad(rij);
+}
+
+float3 computeViscosityForce(float r, float3 velocityI, float3 velocityJ, float densityJ)
+{
+    if (densityJ <= 0.0) return float3(0, 0, 0);
+    // Müller et al. viscosity: velocity difference weighted by the viscosity
+    // kernel's Laplacian (a scalar), which is what viscosityKernel() returns.
+    float3 vij = velocityJ - velocityI;
+    return viscosityConstant * particleMass * (vij / densityJ) * viscosityKernel(r);
+}
+
+void computeParticleCollisions(inout Particle pi, in Particle pj)
+{
+    float3 delta = pi.position.xyz - pj.position.xyz;
+    float r = length(delta);
+
+    if (r <= 0 || r >= particleRadius * 2)
+        return;
+
+    float3 n = delta / r;
+
+    // Positional correction (soft)
+    float penetration = (particleRadius * 2) - r;
+    pi.position.xyz += n * (penetration * 0.5f);
+
+    // Velocity correction (no reflection)
+    float vn = dot(pi.velocity.xyz, n);
+    if (vn < 0)
+        pi.velocity.xyz -= vn * n;
+}
+
+/*
+* Range [start, end) of slots holding the particles of the 3 cells (x-1, x, x+1) in one
+* row of the grid (at y + dy, z + dz). Cells are numbered x + y*res.x + z*res.x*res.y and
+* the sorted buffers are in cell order, so those 3 cells sit next to each other and can be
+* read as one run: 9 rows cover all 27 neighbour cells. Rows outside the grid come back
+* empty and x is clamped to the grid, so an edge cell never wraps to the far side.
+*/
+uint2 neighborRowRange(int3 cell, int dy, int dz)
+{
+    int y = cell.y + dy;
+    int z = cell.z + dz;
+    if (y < 0 || y >= (int)resolution.y || z < 0 || z >= (int)resolution.z)
+        return uint2(0, 0);
+
+    int firstX = max(cell.x - 1, 0);
+    int lastX  = min(cell.x + 1, (int)resolution.x - 1);
+
+    uint rowStart = CellToIndex(int3(0, y, z));
+    uint start = cellStarts[rowStart + firstX];
+    uint end   = cellStarts[rowStart + lastX] + cellSizes[rowStart + lastX];
+
+    return uint2(start, min(end, start + MAX_NEIGHBORS_PER_ROW));
+}
+
+// Density at pi.position from all neighbours in the sorted buffers. Reads positions only.
+void CalculateDensity(int3 cell, inout Particle pi, uint slot)
+{
+    float tempDensity = particleMass * polySixKernel(0.0);
+
+    for (int dz = -1; dz <= 1; dz++)
+    {
+        for (int dy = -1; dy <= 1; dy++)
+        {
+            uint2 range = neighborRowRange(cell, dy, dz);
+            for (uint s = range.x; s < range.y; s++)
+            {
+                if (s == slot)
+                    continue;
+                float3 rij = pi.position.xyz - sortedPositions[s].xyz;
+                tempDensity += particleMass * polySixKernel(length(rij));
+            }
+        }
+    }
+    pi.density = tempDensity;
+}
+
+forcesData CalculateParticleForces(int3 cell, inout Particle pi, uint slot)
+{
+    forcesData fData;
+    fData.pressure = float3(0, 0, 0);
+    fData.viscosity = float3(0, 0, 0);
+
+    // Caculation for given particle
+    for (int dz = -1; dz <= 1; dz++)
+    {
+        for (int dy = -1; dy <= 1; dy++)
+        {
+            uint2 range = neighborRowRange(cell, dy, dz);
+            for (uint s = range.x; s < range.y; s++)
+            {
+                if (s == slot)
+                    continue;
+
+                /*
+                * Every candidate costs one 16-byte position read. ~88% of them are
+                * further than the smoothing radius and stop here, before velocity,
+                * density and pressure are loaded. This also keeps a NaN neighbour from
+                * poisoning pi: an invalid distance never reaches its NaN values.
+                */
+                float3 rij = pi.position.xyz - sortedPositions[s].xyz;
+                float r = length(rij);
+                if (!isDistanceRValid(r))
+                    continue;
+
+                float2 densityPressureJ = sortedDensityPressure[s];
+                float3 velocityJ = sortedVelocities[s].xyz;
+
+                fData.pressure += computePressureForce(rij, r, pi.density, pi.pressure,
+                                                       densityPressureJ.x, densityPressureJ.y);
+                fData.viscosity += computeViscosityForce(r, pi.velocity.xyz, velocityJ, densityPressureJ.x);
+            }
+        }
+    }
+    return fData;
+}
+
+float3 clampSpeed(float3 velocity)
+{
+    float speed = length(velocity);
+    return (speed > MAX_SPEED) ? (velocity / speed) * MAX_SPEED : velocity;
+}
+
+/*
+* Total acceleration on p: gravity + pressure + viscosity, using p.position,
+* p.velocity, p.density and p.pressure exactly as given.
+*/
+float3 computeAcceleration(int3 cell, Particle p, uint slot)
+{
+    float3 acceleration = float3(0.0, -gravityForce, 0.0);   // same as addGravity()
+
+    if (particleMass > 0)
+    {
+        forcesData f = CalculateParticleForces(cell, p, slot);
+        acceleration += -f.pressure + f.viscosity;
+    }
+    return acceleration;
+}
+
+/*
+* Acceleration pi would have at a trial position and velocity (an RK4 stage). Its
+* density and pressure are recomputed at that position first, because the pressure
+* force depends on them.
+*/
+float3 computeStageAcceleration(int3 cell, Particle pi, uint slot, float3 position, float3 velocity)
+{
+    Particle stage = pi;
+    stage.position.xyz = position;
+    stage.velocity.xyz = velocity;
+
+    CalculateDensity(cell, stage, slot);
+    stage.pressure = computePressure(stage.density);
+
+    return computeAcceleration(cell, stage, slot);
+}
+
+/*
+* Classic 4th-order Runge-Kutta for one particle. The state is (x, v) with
+*   dx/dt = v,   dv/dt = a(x, v).
+* Velocity can't be stepped on its own: the pressure force depends on position, so
+* each stage also moves the particle to its trial position, and the final position
+* comes out of the same RK4 combination:
+*
+*   k1 = a(x, v)                                   [k1x = v]
+*   k2 = a(x + dt/2 * k1x, v + dt/2 * k1)          [k2x = v + dt/2 * k1]
+*   k3 = a(x + dt/2 * k2x, v + dt/2 * k2)          [k3x = v + dt/2 * k2]
+*   k4 = a(x + dt   * k3x, v + dt   * k3)          [k4x = v + dt   * k3]
+*   v' = v + dt/6 * (k1  + 2 k2  + 2 k3  + k4 )
+*   x' = x + dt/6 * (k1x + 2 k2x + 2 k3x + k4x)
+*
+* Limitation: only pi moves through the stages. Neighbours stay where they are in the
+* sorted buffers, because a single kernel can't see their intermediate states. True
+* RK4 for the whole fluid would need 4 separate passes over all particles (one per
+* stage), with the stage states stored in extra buffers.
+*/
+void integrateRK4(int3 cell, inout Particle pi, uint slot, float dt)
+{
+    float3 x = pi.position.xyz;
+    float3 v = pi.velocity.xyz;
+    float halfDt = 0.5 * dt;
+
+    // k1 at the start of the step: pi.density / pi.pressure were computed for this
+    // exact position by DensityPass, so no extra density loop is needed.
+    float3 k1v = computeAcceleration(cell, pi, slot);
+    float3 k1x = v;
+
+    float3 k2x = clampSpeed(v + halfDt * k1v);
+    float3 k2v = computeStageAcceleration(cell, pi, slot, x + halfDt * k1x, k2x);
+
+    float3 k3x = clampSpeed(v + halfDt * k2v);
+    float3 k3v = computeStageAcceleration(cell, pi, slot, x + halfDt * k2x, k3x);
+
+    float3 k4x = clampSpeed(v + dt * k3v);
+    float3 k4v = computeStageAcceleration(cell, pi, slot, x + dt * k3x, k4x);
+
+    float sixthDt = dt / 6.0;
+    pi.velocity.xyz = clampSpeed(v + sixthDt * (k1v + 2.0 * k2v + 2.0 * k3v + k4v));
+    pi.position.xyz = x + sixthDt * (k1x + 2.0 * k2x + 2.0 * k3x + k4x);
+}
+
+/*
+* Step 1 of the simulation step: density and pressure of every particle (fluid and walls)
+* from this step's positions, all read from the same sorted snapshot, so every particle
+* sees the same consistent picture of its neighbours.
+*
+* Wall particles never move, but they do track their own density and pressure from
+* everything around them, fluid and other walls (a "dynamic boundary"). When fluid
+* presses into a wall, the wall particles' density rises above restDensity, their
+* pressure rises, and through the pressure sum that pushes the fluid back. A wall with no
+* fluid nearby stays below restDensity, so its pressure is clamped to 0.
+*/
+[numthreads(256,1,1)]
+void DensityPass(uint3 id : SV_DispatchThreadID)
+{
+    uint slot = id.x;
+    if (slot >= particleCount)
+        return;
+
+    Particle pi = (Particle)0;
+    pi.position = sortedPositions[slot];
+    int3 cell = PositionToCell(pi.position.xyz);
+
+    CalculateDensity(cell, pi, slot);
+    sortedDensityPressure[slot] = float2(pi.density, computePressure(pi.density));
+}
+
+/*
+* Step 2: forces + integration. ONE THREAD PER PARTICLE, in sorted slot order, so the
+* 32 threads of a warp hold particles from the same few neighbouring cells, walk the
+* same neighbour rows and read the same memory.
+* Reads only the sorted buffers, writes only the plain buffers: no read/write race.
+* Dispatched with ceil(particleCount / 256) groups, particleCount = fluid + walls.
+*/
+[numthreads(256,1,1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    uint slot = id.x;
+    if (slot >= particleCount)
+        return;
+
+    Particle pi = loadSortedParticle(slot);
+
+    // The cell this particle was sorted into this step (same position the grid used).
+    int3 cell = PositionToCell(pi.position.xyz);
+
+    // Walls don't move. They are still written: every slot of the write buffers is
+    // overwritten each step, otherwise the slot would keep another particle's old data.
+    if (pi.isBoundary != 0)
+    {
+        storeParticle(slot, pi);
+        return;
+    }
+
+#if USE_RK4
+    integrateRK4(cell, pi, slot, timeStep);
+#else
+    // semi-implicit Euler: velocity first, then position with the new velocity
+    forcesData fdata = CalculateParticleForces(cell, pi, slot);
+
+    addGravity(pi, timeStep);
+    if (particleMass > 0) {
+        pi.velocity.xyz += (-1.0f * fdata.pressure) * timeStep;
+        pi.velocity.xyz += (fdata.viscosity * timeStep);
+    }
+
+    pi.velocity.xyz = clampSpeed(pi.velocity.xyz);
+    pi.position.xyz += pi.velocity.xyz * timeStep;
+#endif
+
+    computeBoundCollision(pi);
+    storeParticle(slot, pi);
+}

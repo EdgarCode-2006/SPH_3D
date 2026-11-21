@@ -1,0 +1,122 @@
+// Data
+#include "../ParticleData.hlsl"
+
+#include "optimization/PositionToIndex.hlsl"
+
+#pragma kernel PerCellCounter
+#pragma kernel ClearUIntBuffer
+#pragma kernel FillParticleIndexList
+#pragma kernel ReorderParticles
+
+/*
+* Particle state from the end of the previous step (written by CSMain).
+*   positions:  xyz = position, w = 1 for a wall particle, 0 for fluid
+*   velocities: xyz = velocity
+*/
+StructuredBuffer<float4> positions;
+StructuredBuffer<float4> velocities;
+
+/*
+* Copies of every particle in grid-cell order, made by ReorderParticles and read by
+* DensityPass / CSMain. Slot s holds the particle listed at particleIndexes[s].
+*/
+RWStructuredBuffer<float4> sortedPositions;
+RWStructuredBuffer<float4> sortedVelocities;
+
+RWStructuredBuffer<uint> cellCounts;
+
+// cellStarts gets modified for proper particle indexing
+RWStructuredBuffer<uint> inCellOffset;
+RWStructuredBuffer<uint> cellStarts;
+
+// This is the final neightbor buffer for all particle indexes.
+RWStructuredBuffer<uint> particleIndexes;
+
+RWStructuredBuffer<DebugStruct> debugData;
+
+/*
+* this kernel is used in order to count the number of
+* particles which maps to the same index in 1D taking the
+* 3D coordinate of each particle and mapping it into the 1D
+* grid.
+*/
+[numthreads(256,1,1)]
+void PerCellCounter(uint3 id : SV_DispatchThreadID)
+{
+    uint index = id.x;
+
+    if (index >= particleCount)
+        return;
+    uint newCount = 0;
+
+    uint cellIndex = PositionToIndex(positions[index].xyz);
+
+    // Add it to its cellIndex position in the hash map buffer.
+    InterlockedAdd(cellCounts[cellIndex], 1, newCount);
+}
+
+[numthreads(256, 1, 1)]
+void ClearUIntBuffer(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < elementCount)
+    {
+        cellCounts[id.x] = 0;
+    }
+}
+
+/*
+ * This kernel computes each particle's position within the uniform grid
+ * and updates the particleIndices buffer accordingly.
+ *
+ * The workflow is as follows:
+ * 1. Each particle calculates its 1D grid cell index based on its position.
+ * 2. Using the cellStarts buffer, which stores the starting offset
+ *    of each cell in particleIndices, the particle determines where
+ *    to write its own index in the particleIndices buffer.
+ * 3. The particle writes its index into particleIndices at this offset,
+ *    then atomically increments the corresponding value in cellStarts.
+ *    This ensures that multiple particles in the same cell are stored
+ *    sequentially without conflicts.
+ *
+ * In other words:
+ * - cellStarts gives each cell a contiguous region in particleIndices
+ *   to store its particle indices.
+ * - atomic increment guarantees that each particle gets a unique slot
+ *   within that cell's region, even if multiple threads are writing
+ *   concurrently.
+ */
+[numthreads(256,1,1)]
+void FillParticleIndexList(uint3 id : SV_DispatchThreadID)
+{
+    uint index = id.x;
+    if (index >= particleCount) return;
+
+    uint cellIndex = PositionToIndex(positions[index].xyz);
+
+    // Get a unique insertion offset inside this cell
+    uint offsetInCell = 0;
+    InterlockedAdd(inCellOffset[cellIndex], 1, offsetInCell);
+
+    // Global array write index = start of cell + offset
+    uint writeIndex = cellStarts[cellIndex]  + offsetInCell;
+
+    particleIndexes[writeIndex] = index;
+}
+
+/*
+* Copies every particle into the slot the grid gave it (gather by particleIndexes), so
+* particles in the same or neighbouring cells sit next to each other in memory. After
+* this, DensityPass and CSMain read neighbours straight from the sorted buffers by slot.
+* positions / velocities were written in last step's cell order, so this read is close
+* to sequential too.
+*/
+[numthreads(256,1,1)]
+void ReorderParticles(uint3 id : SV_DispatchThreadID)
+{
+    uint slot = id.x;
+    if (slot >= particleCount) return;
+
+    uint source = particleIndexes[slot];
+    sortedPositions[slot] = positions[source];
+    sortedVelocities[slot] = velocities[source];
+}

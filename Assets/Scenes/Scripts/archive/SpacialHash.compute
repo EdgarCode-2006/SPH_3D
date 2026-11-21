@@ -1,0 +1,141 @@
+// // Data
+// #include "../ParticleData.hlsl"
+// #include "setData/initStructs.hlsl"
+
+// // Optimization
+// #include "optimization/MortonIndexer.hlsl"
+// #include "optimization/mortonNeighborLookup.hlsl"
+
+#pragma kernel CSPlaceHolder
+// #pragma kernel CSMain_Morton
+// #pragma kernel CSSequence_Morton_Pairs
+// #pragma kernel CSGet_Neighbours
+
+// RWStructuredBuffer<Particle> particles;
+// RWStructuredBuffer<MortonPair> mortonPairs;
+// RWStructuredBuffer<MortonCell> mortonCells;
+// RWStructuredBuffer<CellIndex> cellIndex;
+// RWStructuredBuffer<uint> neighbourIndexes;
+
+// // This strcut holds values for debugging later by fetching back to the CPU
+// RWStructuredBuffer<DebugStruct> debugData;
+
+// static const uint MAX_NEIGHBORS = 128;
+
+[numthreads(256,1,1)]
+void CSPlaceHolder (uint3 id : SV_DispatchThreadID)
+{
+    uint index = id.x;
+    
+    if (index >= 10)
+        return;
+}
+
+// [numthreads(256,1,1)]
+// void CSMain_Morton (uint3 id : SV_DispatchThreadID)
+// {
+//     uint index = id.x;
+    
+//     if (index >= particleCount)
+//         return;
+//     float minBound = boundX.x;
+//     float maxBound = boundX.y;
+//     uint mortonCode = 0;
+
+//     mortonCode = mortonIndexer3D(particles[index].position.xyz, minBound, maxBound, 10.0);
+//     mortonPairs[index] = initMortonPairStruct(mortonCode, index);
+
+//     particles[index].mortonCode = mortonCode;
+// }
+
+// [numthreads(256,1,1)]
+// void CSCount_Morton_Pairs(uint3 id : SV_DispatchThreadID)
+// {
+//     uint index = id.x;
+//     uint pairCount = 0;
+
+//     if (index >= cellCount)
+//         return;
+//     debugData[index].uintValue1 = cellCount;
+//     if (index >= cellCount - 1u) {
+//         pairCount = particleCount - mortonCells[index].mortonPairStartIndex;
+//     } else {
+//         pairCount = mortonCells[index + 1].mortonPairStartIndex - mortonCells[index].mortonPairStartIndex;
+//     }
+//     mortonCells[index].mortonPairCount = pairCount;
+// }
+
+// // This kernel looks at the mortonPairs buffer and compares each in order to
+// // Generate a new mortonCell. This creates a Set of unique mortonCodes along
+// // with where they appear in the array of MortonPair by morton Code.
+// [numthreads(256,1,1)]
+// void CSSequence_Morton_Pairs(uint3 id : SV_DispatchThreadID)
+// {
+//     uint index = id.x;
+
+//     if (index >= particleCount)
+//         return;
+//     if (index == 0 || mortonPairs[index - 1].mortonCode != mortonPairs[index].mortonCode) {
+//         uint newCellIndex = 0;
+//         InterlockedAdd(cellIndex[0].cellIndex, 1, newCellIndex);
+
+//         mortonCells[newCellIndex] = initMortonCellStruct(index, mortonPairs[index].mortonCode);
+//     }
+// }
+
+// void fillNeighboursArray(uint2 adjacencyArray[27], uint offsetNeighborIndex)
+// {
+//     uint localParticleCount = 0;
+//     uint localStartIndex = 0;
+
+//     uint neighbourCount = 0;
+
+//     for (uint i = 0; i < 27 && adjacencyArray[i].y > 0; i++) {
+//         localParticleCount = adjacencyArray[i].y;
+//         localStartIndex = adjacencyArray[i].x;
+//         for (uint j = localStartIndex; j < (localStartIndex + localParticleCount); j++) {
+//             if (neighbourCount < MAX_NEIGHBORS) {
+//                 neighbourIndexes[offsetNeighborIndex + neighbourCount] = mortonPairs[j].particleIndex;
+//                 neighbourCount++;
+//             }
+//         }
+//     }
+
+//     // set the leftover neighbors to be max int in order to detect them when
+//     // parsing later.
+//     for (uint k = neighbourCount; k < MAX_NEIGHBORS; k++) {
+//         neighbourIndexes[offsetNeighborIndex + k] = 0xFFFFFFF;
+//         neighbourCount++;
+//     }
+// }
+
+// void getNeighbourParticles(uint currentMortonCode, uint offsetNeighborIndex)
+// {
+//     uint neighbourCellCount = 0;
+//     uint2 adjacencyArray[27];
+
+//     // Set the array for fetching the adjacent particles.
+//     [unroll] for (uint k = 0; k < 27; k++) {
+//         adjacencyArray[k] = uint2(0, 0);
+//     }
+
+//     for (uint i = 0; i < cellCount; i++) {
+//         if (isAdjacent(currentMortonCode, mortonCells[i].mortonCode)) {
+//             adjacencyArray[neighbourCellCount] = uint2(uint(mortonCells[i].mortonPairStartIndex), uint(mortonCells[i].mortonPairCount));
+//             neighbourCellCount += 1;
+//         }
+//     }
+//     fillNeighboursArray(adjacencyArray, offsetNeighborIndex);
+// }
+
+// [numthreads(256,1,1)]
+// void CSGet_Neighbours(uint3 id : SV_DispatchThreadID)
+// {
+//     uint index = id.x;
+
+//     if (index >= particleCount)
+//         return;
+
+//     uint neighborArrayIndex = index * MAX_NEIGHBORS;
+//     getNeighbourParticles(particles[index].mortonCode, neighborArrayIndex);
+// }
